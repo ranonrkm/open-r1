@@ -104,6 +104,7 @@ class PipelineParameters:
     # Generation parameters
     override_batch_size: int | None = None
     num_fewshot_seeds: int = 1
+    start_sample: int = 0   
     max_samples: int | None = None
     use_chat_template: bool = False
     system_prompt: str | None = None
@@ -230,6 +231,7 @@ class Pipeline:
                 fewshot_dict=fewshots_dict,
                 num_fewshot_seeds=self.pipeline_parameters.num_fewshot_seeds,
                 lm=self.model,
+                start_sample=self.pipeline_parameters.start_sample, 
                 max_samples=self.pipeline_parameters.max_samples,
                 evaluation_tracker=self.evaluation_tracker,
                 use_chat_template=self.pipeline_parameters.use_chat_template,

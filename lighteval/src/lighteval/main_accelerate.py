@@ -23,6 +23,7 @@
 import logging
 import os
 from typing import Optional
+import re
 
 from typer import Argument, Option
 from typing_extensions import Annotated
@@ -90,6 +91,9 @@ def accelerate(  # noqa C901
         bool, Option(help="Save detailed, sample per sample, results.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = False,
     # === debug ===
+    start_sample: Annotated[
+        int, Option(help="Start sample for evaluation.", rich_help_panel=HELP_PANEL_NAME_3)
+    ] = 0,
     max_samples: Annotated[
         Optional[int], Option(help="Maximum number of samples to evaluate on.", rich_help_panel=HELP_PANEL_NAME_3)
     ] = None,
@@ -137,6 +141,7 @@ def accelerate(  # noqa C901
         custom_tasks_directory=custom_tasks,
         override_batch_size=override_batch_size,
         num_fewshot_seeds=num_fewshot_seeds,
+        start_sample=start_sample,
         max_samples=max_samples,
         use_chat_template=use_chat_template,
         system_prompt=system_prompt,
@@ -189,6 +194,10 @@ def accelerate(  # noqa C901
         else:
             model_config = TransformersModelConfig(**args_dict)
     else:
+        generation_parameters = GenerationParameters.from_model_args(model_args)
+        # We slice out generation_parameters from model_args to avoid double-counting in the VLLMModelConfig
+        model_args = re.sub(r"generation_parameters=\{.*?\},?", "", model_args).strip(",")
+
         model_args_dict: dict = {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in model_args.split(",")}
         model_args_dict["accelerator"] = accelerator
         model_args_dict["use_chat_template"] = use_chat_template

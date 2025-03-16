@@ -578,6 +578,7 @@ def create_requests_from_tasks(  # noqa: C901
     fewshot_dict: dict[str, list[Tuple[int, bool]]],
     num_fewshot_seeds: int,
     lm: TransformersModel,
+    start_sample: int | None,
     max_samples: int | None,
     evaluation_tracker: "EvaluationTracker",
     use_chat_template: bool,
@@ -617,6 +618,9 @@ def create_requests_from_tasks(  # noqa: C901
     # Get lists of each type of request
     for task_name, task in task_dict_items:
         task_docs = list(task.eval_docs())
+        start_id = max(0, start_sample) if start_sample else 0
+        if start_id >= len(task_docs):
+            raise ValueError(f"Start sample {start_id} is greater than the number of documents {len(task_docs)}.")
         n_samples = min(max_samples, len(task_docs)) if max_samples else len(task_docs)
         evaluation_tracker.task_config_logger.log_num_docs(task_name, len(task_docs), n_samples)
 
@@ -634,7 +638,7 @@ def create_requests_from_tasks(  # noqa: C901
 
         # We can do several round of fewshots sampling to get some variance information
         for seed in seeds:
-            for doc_id in range(n_samples):
+            for doc_id in range(start_id, start_id+n_samples):
                 doc_id_seed = f"{doc_id}_{seed}"  # if we do several rounds of few shot sampling we have several seeds
                 for num_fewshot, truncate_few_shots in fewshot_dict[task_name]:
                     doc = task_docs[doc_id]

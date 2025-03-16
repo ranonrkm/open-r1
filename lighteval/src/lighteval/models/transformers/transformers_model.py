@@ -71,6 +71,7 @@ from lighteval.utils.imports import (
 )
 from lighteval.utils.parallelism import find_executable_batch_size
 from lighteval.utils.utils import EnvConfig, as_list, boolstring_to_bool
+from .sparse_attn_utils import enable_sparse_attention
 
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,10 @@ class TransformersModelConfig:
     trust_remote_code: bool = False
     use_chat_template: bool = False
     compile: bool = False
+    sparse_attn: bool = False
+    sparse_attn_topk: int = 0
+    sink: int = 4
+    local: int = 512
     generation_parameters: GenerationParameters = None
     generation_config: GenerationConfig = None
 
@@ -172,6 +177,11 @@ class TransformersModelConfig:
                 logger.info(
                     "You set `multichoice_continuations_start_space` to false. This will remove a leading space from multichoice continuations, if present."
                 )
+
+        self.sparse_attn = boolstring_to_bool(self.sparse_attn)
+        self.sparse_attn_topk = int(self.sparse_attn_topk)
+        self.sink = int(self.sink)
+        self.local = int(self.local)
 
         self.model_parallel = boolstring_to_bool(self.model_parallel)
         self.compile = boolstring_to_bool(self.compile)
@@ -460,7 +470,8 @@ class TransformersModel(LightevalModel):
             token=env_config.token,
             quantization_config=config.quantization_config,
         )
-
+        if config.sparse_attn and config.sparse_attn_topk > 0:
+            enable_sparse_attention(model, config)
         return model
 
     def _create_auto_tokenizer(
@@ -848,7 +859,7 @@ class TransformersModel(LightevalModel):
                 tokenized = self.tokenizer(
                     context,
                     truncation="longest_first",  # we truncate to the model max length if needed
-                    padding="max_length",  # we pad to the longest sequence
+                    padding="longest",  # we pad to the longest sequence
                     return_tensors="pt",
                     max_length=max_context_continuation_size_allowed,  # we always allow minimum one token of generation
                     add_special_tokens=self.add_special_tokens,

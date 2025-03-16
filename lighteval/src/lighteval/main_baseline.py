@@ -50,6 +50,9 @@ def baseline(
     output_dir: Annotated[
         str, Option(help="Output directory for evaluation results.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = "results",
+    start_sample: Annotated[
+        int, Option(help="Start sample for evaluation.", rich_help_panel=HELP_PANEL_NAME_3)
+    ] = 0,
     max_samples: Annotated[
         Optional[int], Option(help="Maximum number of samples to evaluate on.", rich_help_panel=HELP_PANEL_NAME_3)
     ] = None,
@@ -100,10 +103,13 @@ def baseline(
 
     for task_name, task in task_dict.items():
         task_docs = list(task.eval_docs())
-        n_samples = min(max_samples, len(task_docs)) if max_samples else len(task_docs)
+        start_id = max(0, start_sample) if start_sample else 0
+        if start_id >= len(task_docs):
+            raise ValueError(f"start_sample ({start_sample}) is greater than the number of samples ({len(task_docs)})")
+        n_samples = min(max_samples, len(task_docs) - start_id) if max_samples else len(task_docs)
 
         p_correct_score = [
-            len(as_list(task_doc.gold_index)) / len(task_doc.choices) for task_doc in task_docs[:n_samples]
+            len(as_list(task_doc.gold_index)) / len(task_doc.choices) for task_doc in task_docs[start_id : start_id + n_samples]
         ]
 
         metric_results = {
