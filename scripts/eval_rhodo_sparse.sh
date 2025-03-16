@@ -4,7 +4,7 @@ start_id=$1
 DATA_DIR=/sensei-fs/users/xuhuang/rsadhukh/data/evals
 mkdir -p $DATA_DIR
 NUM_GPUS=8
-MODEL=open-r1/OpenR1-Qwen-7B
+MODEL=$2
 MODEL_ARGS="pretrained=$MODEL,dtype=bfloat16,sparse_attn=true,sparse_attn_topk=256,sink=4,local=512,generation_parameters={max_new_tokens:30720,temperature:0.6,top_p:0.95}"
 OUTPUT_DIR=${DATA_DIR}/$MODEL
 
