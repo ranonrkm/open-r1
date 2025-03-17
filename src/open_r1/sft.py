@@ -47,7 +47,7 @@ from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import SFTConfig
-from open_r1.utils import get_tokenizer
+from open_r1.utils import get_tokenizer, SparseSFTTrainer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import (
@@ -130,15 +130,26 @@ def main(script_args, training_args, model_args):
     ############################
     # Initialize the SFT Trainer
     ############################
-    trainer = SFTTrainer(
-        model=model_args.model_name_or_path,
-        args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=tokenizer,
-        peft_config=get_peft_config(model_args),
-        callbacks=get_callbacks(training_args, model_args),
-    )
+    if training_args.sparse_training:
+        trainer = SparseSFTTrainer(
+            model=model_args.model_name_or_path,
+            args=training_args,
+            train_dataset=dataset[script_args.dataset_train_split],
+            eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            callbacks=get_callbacks(training_args, model_args),
+        )
+    else:
+        trainer = SFTTrainer(
+            model=model_args.model_name_or_path,
+            args=training_args,
+            train_dataset=dataset[script_args.dataset_train_split],
+            eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            callbacks=get_callbacks(training_args, model_args),
+        )
 
     ###############
     # Training loop

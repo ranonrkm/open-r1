@@ -57,7 +57,18 @@ class SFTConfig(trl.SFTConfig):
     """
     args for callbacks, benchmarks etc
     """
-
+    sparse_training: bool = field(
+        default=False, metadata={"help": "Whether to use sparse attention training."}
+    )
+    sink: int = field(
+        default=4, metadata={"help": "The sink to use for sparse attention training."}
+    )
+    local: int = field(
+        default=1024, metadata={"help": "The local to use for sparse attention."}
+    )
+    sparse_attn_topk: int = field(
+        default=256, metadata={"help": "The topk to use for sparse attention."}
+    )
     benchmarks: list[str] = field(
         default_factory=lambda: [], metadata={"help": "The benchmarks to run after training."}
     )
