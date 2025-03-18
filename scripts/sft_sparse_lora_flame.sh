@@ -1,4 +1,12 @@
-#!/bin/bash
+#SBATCH --job-name=sft
+#SBATCH --partition=preempt
+#SBATCH --nodes=1
+#SBATCH --time=32:00:00
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:8
+#SBATCH --output=logs/sft_7b_sparse_lora.out
+#SBATCH --error=logs/sft_7b_sparse_lora.err
 
 export WANDB_ENTITY=infini-lab
 export WANDB_PROJECT=openr1
@@ -31,8 +39,6 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --eval_strategy no \
     --gradient_checkpointing \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
-    --hub_model_id OpenR1-Qwen-7B-Instruct-SFT-sparse-lora-local1024-topk256 \
-    --hub_strategy every_save \
     --log_level info \
     --logging_steps 5 \
     --logging_strategy steps \
@@ -47,3 +53,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --seed 42 \
     --sparse_training \
     --sparse_attn_topk 256 
+
+
+    # --hub_model_id OpenR1-Qwen-7B-Instruct-SFT-sparse-lora-local1024-topk256 \
+    # --hub_strategy every_save \

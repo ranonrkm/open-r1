@@ -1,4 +1,12 @@
-#!/bin/bash
+#SBATCH --job-name=sft
+#SBATCH --partition=preempt
+#SBATCH --nodes=1
+#SBATCH --time=32:00:00
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:8
+#SBATCH --output=logs/sft_7b_sparse_lora.out
+#SBATCH --error=logs/sft_7b_sparse_lora.err
 
 export WANDB_ENTITY=infini-lab
 export WANDB_PROJECT=openr1
@@ -7,10 +15,6 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --model_revision main \
     --torch_dtype bfloat16 \
     --attn_implementation flash_attention_2 \
-    --use_peft \
-    --lora_r 16 \
-    --lora_alpha 32 \
-    --lora_dropout 0.05 \
     --dataset_name open-r1/OpenR1-Math-220k \
     --dataset_num_proc 48 \
     --max_length 32768 \
@@ -18,7 +22,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --optim adamw_torch \
     --lr_scheduler_type linear \
     --warmup_ratio 0.1 \
-    --learning_rate 1e-4 \
+    --learning_rate 5.0e-05 \
     --gradient_accumulation_steps 2 \
     --per_device_eval_batch_size 1 \
     --per_device_train_batch_size 1 \
@@ -31,13 +35,13 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --eval_strategy no \
     --gradient_checkpointing \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
-    --hub_model_id OpenR1-Qwen-7B-Instruct-SFT-sparse-lora-local1024-topk256 \
+    --hub_model_id OpenR1-Qwen-7B-Instruct-SFT-sparse-local1024-topk256 \
     --hub_strategy every_save \
     --log_level info \
     --logging_steps 5 \
     --logging_strategy steps \
     --packing false \
-    --output_dir data/OpenR1-Qwen-7B-Instruct-SFT-sparse-lora-local1024-topk256 \
+    --output_dir data/OpenR1-Qwen-7B-Instruct-SFT-sparse-local1024-topk256 \
     --overwrite_output_dir \
     --push_to_hub \
     --report_to wandb \
