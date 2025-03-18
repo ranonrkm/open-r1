@@ -19,14 +19,17 @@ import random
 import re
 
 import nltk
-
+from filelock import FileLock
 
 def download_nltk_resources():
     """Download 'punkt' if not already installed"""
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt")
+    lock = FileLock("nltk_punkt.lock")
+
+    with lock:
+        try:
+            nltk.data.find("tokenizers/punkt")
+        except LookupError:
+            nltk.download("punkt")
 
 
 download_nltk_resources()

@@ -79,6 +79,7 @@ dependencies = [
     "protobuf==3.20.*", # pinned for sentencepiece compat
     "pycountry",
     "fsspec>=2023.12.2",
+    "filelock"
 ]
 
 [project.optional-dependencies]
