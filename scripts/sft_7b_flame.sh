@@ -11,7 +11,7 @@
 
 export WANDB_PROJECT=openr1
 accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r1/sft.py \
-    --model_name_or_path base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct  \
+    --model_name_or_path Qwen/Qwen2.5-7B-Instruct  \
     --model_revision main \
     --torch_dtype bfloat16 \
     --attn_implementation flash_attention_2 \
@@ -39,7 +39,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --logging_steps 5 \
     --logging_strategy steps \
     --packing true \
-    --output_dir data/OpenR1-Qwen-7B-Math-dense-packing \
+    --output_dir data/OpenR1-Qwen-7B-dense-packing \
     --overwrite_output_dir \
     --push_to_hub \
     --report_to wandb \
