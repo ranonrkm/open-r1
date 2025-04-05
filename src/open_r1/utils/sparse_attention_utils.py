@@ -107,22 +107,46 @@ def local_attn_forward(
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        sliding_window = None
+        local_window_size = getattr(self, "local", 0)
+        if local_window_size > 0:
+             sliding_window = local_window_size
+        else:
+             sliding_window = None
 
-        attention_interface = flash_attn_triton_interface
+        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
 
-        attn_output, attn_weights = attention_interface(
+        query_0, query_1 = torch.tensor_split(query_states, [self.num_key_value_groups], dim=1)
+        key_0, key_1 = torch.tensor_split(key_states, [1], dim=1)
+        value_0, value_1 = torch.tensor_split(value_states, [1], dim=1)
+
+        attn_output_0, attn_weights_0 = attention_interface(
             self,
-            query_states,
-            key_states,
-            value_states,
+            query_0,
+            key_0,
+            value_0,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,  # main diff with Llama
+            **kwargs,
+        )
+
+        attn_output_1, attn_weights_1 = attention_interface(
+            self,
+            query_1,
+            key_1,
+            value_1,
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=sliding_window,  # main diff with Llama
             **kwargs,
         )
-        
+        attn_output = torch.cat([attn_output_0, attn_output_1], dim=2)
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, None
+
+# divide query_states, key_states, value_states into two parts - first head (or head group) for dense attention or rest for sparse attention
+        
