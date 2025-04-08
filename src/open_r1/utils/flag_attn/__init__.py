@@ -51,8 +51,10 @@ def cplsh_attn_triton_interface(
         value,
         q_codes,
         k_codes,
-        True,
-        scaling
+        causal=True,
+        sm_scale=scaling,
+        dropout_p=dropout,
+        local_size=sliding_window,
     )
     attn_output = attn_output.transpose(1, 2)
 

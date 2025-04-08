@@ -60,7 +60,7 @@ class SFTConfig(trl.SFTConfig):
     sparse_training: bool = field(
         default=False, metadata={"help": "Whether to use sparse attention training."}
     )
-    sparse_attn: Literal["local", "topk"] = field(
+    sparse_attn: Literal["local", "topk", "lsh"] = field(
         default="local", metadata={"help": "The type of sparse attention to use."}
     )
     full_attn_layers: list[int] = field(

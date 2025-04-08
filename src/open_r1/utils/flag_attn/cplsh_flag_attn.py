@@ -509,7 +509,7 @@ def _fwd_kernel(
 
         # -- update m_i and l_i --
         l_i = l_i * alpha + p_sum
-        cnt += tl.sum(hash_mask, 1).to(tl.int32)  # count the number of hash matches
+        cnt += tl.sum(hash_mask.to(tl.int32), 1)  # count the number of hash matches
         m_i = m_i_new
         # update pointers
         k_ptrs += BLOCK_N * stride_kn

@@ -3,9 +3,11 @@ import torch
 import torch.nn.functional as F
 from trl import SFTTrainer
 from ..configs import SFTConfig
-from .sparse_attention_utils import local_attn_forward
+from .sparse_attention_utils import local_attn_forward, CPLSHForCausalLM
+from .repeat_attention import RepeatedForCausalLM
 
 class SparseSFTTrainer(SFTTrainer):
+    '''
     def _create_model_from_path(self, model_path: str, args: SFTConfig):
         model = super()._create_model_from_path(model_path, args)
 
@@ -25,6 +27,33 @@ class SparseSFTTrainer(SFTTrainer):
                     patch_forward(child)
 
         patch_forward(model)
+        return model
+        '''
+    
+    def _create_model_from_path(self, model_path: str, args: SFTConfig):
+        """Creates a model from a path or model identifier."""
+        model_init_kwargs = args.model_init_kwargs or {}
+        # Handle torch dtype
+        torch_dtype = model_init_kwargs.get("torch_dtype")
+        if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+            pass  # torch_dtype is already a torch.dtype or "auto" or None
+        elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+            torch_dtype = getattr(torch, torch_dtype)
+            model_init_kwargs["torch_dtype"] = torch_dtype
+        else:
+            raise ValueError(
+                "Invalid `torch_dtype` passed to `SFTConfig`. Expected either 'auto' or a string representing "
+                f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+            )
+        # Disable caching if gradient checkpointing is enabled (not supported)
+        if args.gradient_checkpointing:
+            model_init_kwargs["use_cache"] = False
+
+        # Create model
+        # model = CPLSHForCausalLM.from_pretrained(model_path, **model_init_kwargs)
+        if args.sparse_attn == "local":
+            model_init_kwargs["sliding_window"] = args.local
+        model = RepeatedForCausalLM.from_pretrained(model_path, **model_init_kwargs)
         return model
     
     @staticmethod
