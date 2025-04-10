@@ -130,13 +130,102 @@ class RepeatedAttention(nn.Module):
         attn_output_1 = attn_output_1.reshape(*input_shape, -1).contiguous()     # B, L, D
         attn_output = torch.cat([attn_output_0, attn_output_1], dim=-1)   # B, L, 2D
         attn_output = self.o_proj(attn_output)   # B, L, D
+        return attn_output, None    
+
+
+class RepeatedAttentionWithGating(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.sink = 0
+        self.local = config.sliding_window
+        assert layer_idx > 0, "First layer is not repeated"
+        
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+        self.q_proj = nn.Linear(config.hidden_size, 2 * config.num_attention_heads * self.head_dim, bias=True)  # every query head is repeated
+        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
+        self.o_proj = nn.Linear(2 * config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        # create gates for each head pair (dense and its local windowed version). the gate is a projection of the hidden states
+        self.attn_gate = nn.Linear(config.hidden_size, config.num_attention_heads, bias=False)
+        
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states)
+        query_0, query_1 = torch.tensor_split(query_states, 2, dim=-1)  
+        query_0 = query_0.view(hidden_shape).transpose(1, 2)
+        query_1 = query_1.view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        
+        gate_states = self.attn_gate(hidden_states)
+        gate_states = F.sigmoid(gate_states)  # B, L, H
+
+        cos, sin = position_embeddings
+        query_0, query_1, key_states = apply_rotary_pos_emb(query_0, query_1, key_states, cos, sin)
+
+        local_window_size = getattr(self, "local", 0)
+        if local_window_size > 0:
+             sliding_window = local_window_size
+        else:
+             sliding_window = None
+
+        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+
+        attn_output_0, attn_weights_0 = attention_interface(
+            self,
+            query_0,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,  # main diff with Llama
+            **kwargs,
+        )   # B, L, H, D
+        
+
+        attn_output_1, attn_weights_1 = attention_interface(
+            self,
+            query_1,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=sliding_window,  # main diff with Llama
+            **kwargs,
+        )   # B, L, H, D
+        
+        attn_output_0 = gate_states.unsqueeze(-1) * attn_output_0
+        attn_output_1 = (1 - gate_states).unsqueeze(-1) * attn_output_1
+        
+        attn_output_0 = attn_output_0.reshape(*input_shape, -1).contiguous()    # B, L, D
+        attn_output_1 = attn_output_1.reshape(*input_shape, -1).contiguous()     # B, L, D
+        attn_output = torch.cat([attn_output_0, attn_output_1], dim=-1)   # B, L, 2D
+        attn_output = self.o_proj(attn_output)   # B, L, D
         return attn_output, None      
  
 class RepeatedDecoderLayer(Qwen2DecoderLayer):
     def __init__(self, config, layer_idx: int):
         super().__init__(config, layer_idx)
         self.hidden_size = config.hidden_size
-        self.self_attn = RepeatedAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = RepeatedAttention(config=config, layer_idx=layer_idx) if not getattr(config, "gated_attention", False) else RepeatedAttentionWithGating(config=config, layer_idx=layer_idx)
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -323,9 +412,10 @@ class RepeatedForCausalLM(Qwen2ForCausalLM):
     
 
 # create a new checkpoint with the new model class from existing Qwen2 checkpoint
-def convert_checkpoint(model_name: str, output_path: str):
+def convert_checkpoint(model_name: str, output_path: str, use_gated_attention: bool = False):
     # Load the config first
     config = Qwen2ForCausalLM.config_class.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+    config.gated_attention = use_gated_attention
     
     # Create the new model with the same config
     model = RepeatedForCausalLM(config).bfloat16()
@@ -406,6 +496,6 @@ def convert_checkpoint(model_name: str, output_path: str):
     return None  # Return None since we've saved the model
 
 if __name__ == "__main__":
-    convert_checkpoint("/project/flame/rsadhukh/InfiniAI/rsadhukh/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct", 
-                      "/project/flame/rsadhukh/InfiniAI/rsadhukh/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct-repeat-headwise")
-    
+    convert_checkpoint("/project/flame/beidic/rsadhukh/ET/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct", 
+                       "/project/flame/beidic/rsadhukh/ET/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct-repeat-gated",
+                       use_gated_attention=True)
