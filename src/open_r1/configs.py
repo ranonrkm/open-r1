@@ -75,6 +75,9 @@ class SFTConfig(trl.SFTConfig):
     sparse_attn_topk: int = field(
         default=256, metadata={"help": "The topk to use for sparse attention."}
     )
+    gamma_reinit: bool = field(
+        default=False, metadata={"help": "Whether to reinitialize the gamma for the repeated attention heads."}
+    )
     benchmarks: list[str] = field(
         default_factory=lambda: [], metadata={"help": "The benchmarks to run after training."}
     )

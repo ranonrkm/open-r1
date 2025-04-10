@@ -1,4 +1,5 @@
 from types import MethodType
+from typing import Optional
 import torch
 import torch.nn.functional as F
 from trl import SFTTrainer
@@ -54,6 +55,13 @@ class SparseSFTTrainer(SFTTrainer):
         if args.sparse_attn == "local":
             model_init_kwargs["sliding_window"] = args.local
         model = RepeatedForCausalLM.from_pretrained(model_path, **model_init_kwargs)
+        if args.gamma_reinit:
+            eps = 1e-3
+            for i in range(1, len(model.model.layers)):
+                # random_init = torch.randn(model.model.config.num_attention_heads).sign() * eps
+                num_heads = model.model.layers[i].self_attn.gamma.shape[0]
+                random_init = torch.randn(num_heads).sign() * eps
+                model.model.layers[i].self_attn.gamma.data.copy_(random_init)
         return model
     
     @staticmethod
@@ -123,3 +131,20 @@ class SparseSFTTrainer(SFTTrainer):
             self._metrics[mode]["mean_token_accuracy"].append(accuracy)
 
         return (loss, outputs) if return_outputs else loss
+    
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+        mode = "eval" if self.control.should_evaluate else "train"
+        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        
+        # model.model.layers[i].self_attn.gamma to be logged as gamma_i
+        for i in range(1, len(self.model.model.layers)):
+            logs[f"gamma_{i}"] = self.model.model.layers[i].self_attn.gamma.abs().max().item()
+        
+        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
+        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        if mode == "eval":
+            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+
+        logs = {**logs, **metrics}
+        super().log(logs, start_time)
+        self._metrics[mode].clear()

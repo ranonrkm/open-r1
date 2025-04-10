@@ -22,7 +22,7 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q_0, q_1, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -44,9 +44,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
+    q_embed_0 = (q_0 * cos) + (rotate_half(q_0) * sin)
+    q_embed_1 = (q_1 * cos) + (rotate_half(q_1) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+    return q_embed_0, q_embed_1, k_embed
     
 
 class RepeatedAttention(nn.Module):
@@ -67,7 +68,8 @@ class RepeatedAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(2 * config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
-        self.gamma = nn.Parameter(torch.ones(1) * 1e-6, requires_grad=True)  # learnable parameter for sparse attention - zero init for initialization stability
+        # self.gamma = nn.Parameter(torch.ones(1) * 1e-6, requires_grad=True)  # learnable parameter for sparse attention - zero init for initialization stability
+        self.gamma = nn.Parameter(torch.ones(config.num_attention_heads) * 1e-6, requires_grad=True)    # every head has a learnable parameter for sparse attention
         
     def forward(
         self,
@@ -81,12 +83,15 @@ class RepeatedAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_proj(hidden_states)
+        query_0, query_1 = torch.tensor_split(query_states, 2, dim=-1)  
+        query_0 = query_0.view(hidden_shape).transpose(1, 2)
+        query_1 = query_1.view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_0, query_1, key_states = apply_rotary_pos_emb(query_0, query_1, key_states, cos, sin)
 
         local_window_size = getattr(self, "local", 0)
         if local_window_size > 0:
@@ -95,8 +100,6 @@ class RepeatedAttention(nn.Module):
              sliding_window = None
 
         attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
-
-        query_0, query_1 = torch.tensor_split(query_states, 2, dim=1)
 
         attn_output_0, attn_weights_0 = attention_interface(
             self,
@@ -108,8 +111,8 @@ class RepeatedAttention(nn.Module):
             scaling=self.scaling,
             sliding_window=None,  # main diff with Llama
             **kwargs,
-        )
-
+        )   # B, L, H, D
+        
         attn_output_1, attn_weights_1 = attention_interface(
             self,
             query_1,
@@ -120,13 +123,14 @@ class RepeatedAttention(nn.Module):
             scaling=self.scaling,
             sliding_window=sliding_window,  # main diff with Llama
             **kwargs,
-        )
+        )   # B, L, H, D
+        attn_output_1 = F.tanh(self.gamma)[None, None, :, None] * attn_output_1   # tanh(gamma) * attn_output_1
         
-        attn_output = torch.cat([attn_output_0, F.tanh(self.gamma) * attn_output_1], dim=2)  # concat the two halves of the attention output
-
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None       
+        attn_output_0 = attn_output_0.reshape(*input_shape, -1).contiguous()    # B, L, D
+        attn_output_1 = attn_output_1.reshape(*input_shape, -1).contiguous()     # B, L, D
+        attn_output = torch.cat([attn_output_0, attn_output_1], dim=-1)   # B, L, 2D
+        attn_output = self.o_proj(attn_output)   # B, L, D
+        return attn_output, None      
  
 class RepeatedDecoderLayer(Qwen2DecoderLayer):
     def __init__(self, config, layer_idx: int):
@@ -344,18 +348,23 @@ def convert_checkpoint(model_name: str, output_path: str):
     
     # Now handle the RepeatedAttention layers specifically
     # We need to find all the self_attn layers in the model
-    for i in tqdm(range(1, config.num_hidden_layers)):  # Skip the first layer
+    for i in tqdm(range(config.num_hidden_layers)):  # Skip the first layer
         # Get the q_proj and o_proj from the reference model
         q_proj_weight = ref_state_dict[f'model.layers.{i}.self_attn.q_proj.weight']
         q_proj_bias = ref_state_dict[f'model.layers.{i}.self_attn.q_proj.bias']
         o_proj_weight = ref_state_dict[f'model.layers.{i}.self_attn.o_proj.weight']
         
-        # Replicate q_proj weights and biases
-        new_state_dict[f'model.layers.{i}.self_attn.q_proj.weight'] = torch.cat([q_proj_weight, q_proj_weight.clone()], dim=0)
-        new_state_dict[f'model.layers.{i}.self_attn.q_proj.bias'] = torch.cat([q_proj_bias, q_proj_bias.clone()], dim=0)
+        if i == 0:
+            new_state_dict[f'model.layers.{i}.self_attn.q_proj.weight'] = q_proj_weight
+            new_state_dict[f'model.layers.{i}.self_attn.q_proj.bias'] = q_proj_bias
+            new_state_dict[f'model.layers.{i}.self_attn.o_proj.weight'] = o_proj_weight
         
-        # Replicate o_proj weights
-        new_state_dict[f'model.layers.{i}.self_attn.o_proj.weight'] = torch.cat([o_proj_weight, o_proj_weight.clone()], dim=1)
+        else:
+            # Replicate q_proj weights and biases
+            new_state_dict[f'model.layers.{i}.self_attn.q_proj.weight'] = torch.cat([q_proj_weight, q_proj_weight.clone()], dim=0)
+            new_state_dict[f'model.layers.{i}.self_attn.q_proj.bias'] = torch.cat([q_proj_bias, q_proj_bias.clone()], dim=0)
+            # Replicate o_proj weights
+            new_state_dict[f'model.layers.{i}.self_attn.o_proj.weight'] = torch.cat([o_proj_weight, o_proj_weight.clone()], dim=1)
     
     # Clear reference state dict to free memory
     del ref_state_dict
@@ -398,5 +407,5 @@ def convert_checkpoint(model_name: str, output_path: str):
 
 if __name__ == "__main__":
     convert_checkpoint("/project/flame/rsadhukh/InfiniAI/rsadhukh/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct", 
-                      "/project/flame/rsadhukh/InfiniAI/rsadhukh/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct-repeat")
+                      "/project/flame/rsadhukh/InfiniAI/rsadhukh/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct-repeat-headwise")
     
