@@ -54,14 +54,10 @@ class SparseSFTTrainer(SFTTrainer):
         # model = CPLSHForCausalLM.from_pretrained(model_path, **model_init_kwargs)
         if args.sparse_attn == "local":
             model_init_kwargs["sliding_window"] = args.local
+        if args.gated_attention:
+            model_init_kwargs["gated_attention"] = True
         model = RepeatedForCausalLM.from_pretrained(model_path, **model_init_kwargs)
-        if args.gamma_reinit:
-            eps = 1e-3
-            for i in range(1, len(model.model.layers)):
-                # random_init = torch.randn(model.model.config.num_attention_heads).sign() * eps
-                num_heads = model.model.layers[i].self_attn.gamma.shape[0]
-                random_init = torch.randn(num_heads).sign() * eps
-                model.model.layers[i].self_attn.gamma.data.copy_(random_init)
+        
         return model
     
     @staticmethod
@@ -87,7 +83,7 @@ class SparseSFTTrainer(SFTTrainer):
         Compute training loss and additionally compute token accuracies
         """
         mode = "eval" if self.control.should_evaluate else "train"
-        inputs = self.align_inputs(inputs)
+        # inputs = self.align_inputs(inputs)
         (loss, outputs) = super().compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )

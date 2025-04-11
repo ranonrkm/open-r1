@@ -69,7 +69,7 @@ class RepeatedAttention(nn.Module):
         self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(2 * config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         # self.gamma = nn.Parameter(torch.ones(1) * 1e-6, requires_grad=True)  # learnable parameter for sparse attention - zero init for initialization stability
-        self.gamma = nn.Parameter(torch.ones(config.num_attention_heads) * 1e-6, requires_grad=True)    # every head has a learnable parameter for sparse attention
+        self.gamma = nn.Parameter(torch.empty(config.num_attention_heads), requires_grad=True)    # every head has a learnable parameter for sparse attention
         
     def forward(
         self,
@@ -473,6 +473,13 @@ def convert_checkpoint(model_name: str, output_path: str, use_gated_attention: b
     # Ensure model is on CPU before saving
     model = model.cpu()
     
+    # initialize the gate weights
+    for name, param in model.named_parameters():
+        if name.endswith("attn_gate.weight"):
+            nn.init.xavier_uniform_(param)
+        elif "gamma" in name:
+            nn.init.uniform_(param, -1, 1)
+    
     # Save the model config first
     config.save_pretrained(output_path)
     
@@ -496,6 +503,12 @@ def convert_checkpoint(model_name: str, output_path: str, use_gated_attention: b
     return None  # Return None since we've saved the model
 
 if __name__ == "__main__":
-    convert_checkpoint("/project/flame/beidic/rsadhukh/ET/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct", 
-                       "/project/flame/beidic/rsadhukh/ET/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct-repeat-gated",
+    # convert_checkpoint("/project/flame/beidic/rsadhukh/ET/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct", 
+    #                    "/project/flame/beidic/rsadhukh/ET/open-r1/base_ckpt/Qwen/Qwen2.5-Math-7B-Instruct-repeat-gated",
+    #                    use_gated_attention=True)
+    convert_checkpoint("InfiniAILab/Qwen2.5-Math-7B-Instruct-32k",
+                       "/sensei-fs/users/xuhuang/rsadhukh/open-r1/Qwen2.5-Math-7B-Instruct-repeat-gated",
                        use_gated_attention=True)
+    convert_checkpoint("InfiniAILab/Qwen2.5-Math-7B-Instruct-32k",
+                       "/sensei-fs/users/xuhuang/rsadhukh/open-r1/Qwen2.5-Math-7B-Instruct-repeat",
+                       use_gated_attention=False)
