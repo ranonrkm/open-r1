@@ -117,7 +117,7 @@ class CPLSHVotingCache(CPLSHCache):
             _block_count = torch.zeros((B, H, L, K), device=_key_codes.device, dtype=torch.int32)
             _block_count.scatter_add_(dim=-1, index=_block_code, src=torch.ones_like(_block_count))
             block_codes.append(_block_count.argmax(dim=-1)) # B H L
-        block_codes = torch.cat(block_codes, dim=-2)    # B H N_blk L
+        block_codes = torch.stack(block_codes, dim=-2)    # B H N_blk L
         
         if len(self.key_codes) <= layer_idx - self.n_full:
             self.key_codes.append(block_codes)
@@ -250,7 +250,7 @@ def attn_forward_chunked(
             q_codes = torch.einsum("bhrnd,hlkd->bhrnlk", 
                                     query_states_reshaped, 
                                     rotation).argmax(dim=-1)  # B H r M L
-            matches = (q_codes.unsqueeze(-2) == key_codes[:, :, None, None, :, :]).sum(dim=-1).gt(1)     # B H r M N_blk
+            matches = (q_codes.unsqueeze(-2) == key_codes[:, :, None, None, :, :]).sum(dim=-1).gt(0)     # B H r M N_blk
             matches = matches.unsqueeze(-1).expand(-1, -1, -1, -1, -1, BLOCK_SIZE)  # B H r M blk N_blk
             matches = matches.reshape(*matches.shape[:-2], -1)  # B H r M N
             
@@ -262,7 +262,6 @@ def attn_forward_chunked(
             topk = torch.topk(w, k=10, dim=-1).indices  # B H r M K
             recall = matches.gather(dim=-1, index=topk).float().sum(dim=-1)  # B H r M
             recall = recall.view(-1, recall.size(-1)).mean(dim=0)   # M
-            import pdb; pdb.set_trace()
         
             sparsity = matches.float().sum(dim=-1)
             sparsity = sparsity.view(-1, sparsity.size(-1)).mean(dim=0)

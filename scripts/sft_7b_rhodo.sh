@@ -22,8 +22,8 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --num_train_epochs 3 \
     --bf16 \
     --do_eval false \
-    --use_liger_kernel \
-    --use_liger \
+    --use_liger_kernel True \
+    --use_liger True \
     --eval_strategy no \
     --gradient_checkpointing \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
