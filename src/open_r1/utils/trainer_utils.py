@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from trl import SFTTrainer
 from ..configs import SFTConfig
-from .sparse_attention_utils import local_attn_forward, CPLSHForCausalLM, nsa_attn_forward
+from .sparse_attention_utils import local_attn_forward, CPLSHForCausalLM, nsa_attn_forward, headwise_nsa_attn_forward
 from .repeat_attention import RepeatedForCausalLM
 
 class SparseSFTTrainer(SFTTrainer):
@@ -19,7 +19,10 @@ class SparseSFTTrainer(SFTTrainer):
                         if child.layer_idx not in args.full_attn_layers:
                             child.local = args.local
                     elif args.sparse_attn == "nsa":
-                        child.forward = MethodType(nsa_attn_forward, child)
+                        if args.headwise:
+                            child.forward = MethodType(headwise_nsa_attn_forward, child)
+                        else:
+                            child.forward = MethodType(nsa_attn_forward, child)
                         child.local = args.local
                         child.topk = args.sparse_attn_topk
                     else:

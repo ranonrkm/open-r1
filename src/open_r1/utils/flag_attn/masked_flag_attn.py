@@ -2,12 +2,18 @@ import math
 import torch
 import triton
 import triton.language as tl
-from .total import _total_attention_kernel
-from .split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
-from .split_kv import get_fwd_config as get_fwd_config_kv_split
+try:
+    from .total import _total_attention_kernel
+    from .split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
+    from .split_kv import get_fwd_config as get_fwd_config_kv_split
 
-from .dropout import philox_cuda_seed_offset
-import pdb
+    from .dropout import philox_cuda_seed_offset
+except ImportError:
+    from total import _total_attention_kernel
+    from split_kv import _fwd_split_kv_kernel, _fwd_combine_kv_splits, num_splits_herustic
+    from split_kv import get_fwd_config as get_fwd_config_kv_split
+
+    from dropout import philox_cuda_seed_offset
 
 __all__ = ["attention"]
 
@@ -194,7 +200,7 @@ class FlashAttention(torch.autograd.Function):
         # to work around https://github.com/openai/triton/issues/2441
         device = torch.cuda.device_of(q)
         with torch.cuda.device(device):
-            config = get_bwd_config(B, H, M, N, D, causal)
+            config = get_bwd_preprocess_config(B, H, M, N, D, causal)
             BLOCK_M, BLOCK_N, num_stages, num_warps = config
 
             divisible_m = M % BLOCK_M == 0
@@ -216,6 +222,8 @@ class FlashAttention(torch.autograd.Function):
             # NOTE that dk & dv always have the same number of heads as q, instead of q.
             dk = torch.empty((B, H, N, D), dtype=k.dtype, device=q.device)
             dv = torch.empty((B, H, N, D), dtype=v.dtype, device=q.device)
+            config = get_bwd_kv_config(B, H, M, N, D, causal)
+            BLOCK_M, BLOCK_N, num_stages, num_warps = config
             grid = (triton.cdiv(N, BLOCK_N), H, B)
             _bwd_kv_kernel[grid](
                 q, k, v, block_mask, sm_scale, do,
@@ -240,6 +248,8 @@ class FlashAttention(torch.autograd.Function):
             )
 
             dq = torch.zeros_like(q)
+            config = get_bwd_q_config(B, H, M, N, D, causal)
+            BLOCK_M, BLOCK_N, num_stages, num_warps = config
             grid = (triton.cdiv(M, BLOCK_M), H, B)
             _bwd_q_kernel[grid](
                 q, k, v, block_mask, sm_scale, do,
@@ -264,7 +274,7 @@ class FlashAttention(torch.autograd.Function):
             dk = dk.reshape((B, Hk, num_groups, N, D)).sum(2)
             dv = dv.reshape((B, Hk, num_groups, N, D)).sum(2)
         return dq, dk, dv, None, None, None, None, None, None, None
-
+    
 
 def masked_attention(q, k, v, block_mask, causal=False, sm_scale=None, dropout_p=0.0,
               return_log_normalizer=False, return_total_attention=False, return_seed_offset=False
@@ -331,6 +341,17 @@ def get_fwd_config(B, H, M, N, D, causal):
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 2, 4
+    elif torch.cuda.get_device_capability() == (9, 0):
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
+        else:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 32, 3, 4
     else:
         BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
@@ -524,7 +545,7 @@ def _fwd_kernel(
 
 # --------------------------- Backward ---------------------------
 # NOTE: this function can be overwritten at runtime to use your custom config
-def get_bwd_config(B, H, M, N, D, causal):
+def get_bwd_preprocess_config(B, H, M, N, D, causal):
     if torch.cuda.get_device_capability() == (8, 0):
         if not causal:
             BLOCK_M = 128 if D <= 64 else 64
@@ -547,10 +568,96 @@ def get_bwd_config(B, H, M, N, D, causal):
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
             else:
                 BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+    elif torch.cuda.get_device_capability() == (9, 0):
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
+        else:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
     else:
         BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
     return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
+def get_bwd_kv_config(B, H, M, N, D, causal):
+    if torch.cuda.get_device_capability() == (8, 0):
+        if not causal:
+            BLOCK_M = 128 if D <= 64 else 64
+            BLOCK_N = 64
+            num_stages = 2
+            num_warps = 4
+        else:
+            BLOCK_M = 64
+            BLOCK_N = 64
+            num_stages = 3 if D <= 64 else 2
+            num_warps = 4
+    elif torch.cuda.get_device_capability() == (8, 6): # tune for RTX-3090, device_capability(8, 6)
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 8
+        else:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+    elif torch.cuda.get_device_capability() == (9, 0):
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
+        else:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+    else:
+        BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
+    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
+
+def get_bwd_q_config(B, H, M, N, D, causal):
+    if torch.cuda.get_device_capability() == (8, 0):
+        if not causal:
+            BLOCK_M = 128 if D <= 64 else 64
+            BLOCK_N = 64
+            num_stages = 2
+            num_warps = 4
+        else:
+            BLOCK_M = 64
+            BLOCK_N = 64
+            num_stages = 3 if D <= 64 else 2
+            num_warps = 4
+    elif torch.cuda.get_device_capability() == (8, 6): # tune for RTX-3090, device_capability(8, 6)
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 8
+        else:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 2, 4
+    elif torch.cuda.get_device_capability() == (9, 0):
+        if not causal:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 128, 32, 3, 4
+        else:
+            if D <= 64:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 3, 4
+            else:
+                BLOCK_M, BLOCK_N, num_stages, num_warps = 64, 64, 2, 4
+    else:
+        BLOCK_M, BLOCK_N, num_stages, num_warps = 32, 32, 1, 4
+    return (BLOCK_M, BLOCK_N, num_stages, num_warps)
 
 @triton.jit
 def _bwd_preprocess(
@@ -694,8 +801,8 @@ def _bwd_kv_kernel(
     for start_m in range(lo, M, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m = start_m + offs_m_base
-        causal_mask = (P_SEQ + offs_m[:, None]) >= (offs_n[None, :]) # (BLOCK_M, BLOCK_N)
-
+        causal_mask = (P_SEQ + offs_m[:, None]) >= (offs_n[None, :])
+        
         # load q1, k1, q2, k2, v, do on-chip
         if DIVISIBLE_M:
             q = tl.load(q_ptrs)
@@ -712,8 +819,6 @@ def _bwd_kv_kernel(
             else:
                 blk_mask = tl.load(blk_mask_ptrs, mask=mask_m[:, None] & mask_n[None, :])
                 
-        if CAUSAL:
-            causal_mask = causal_mask & blk_mask
             
         # recompute p = softmax(qk * sm_scale, dim=-1)
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -732,12 +837,12 @@ def _bwd_kv_kernel(
             l = tl.load(L + offs_m, mask=mask_m)
         p = tl.math.exp2(s * qk_scale - l[:, None] * log2e) # (BLOCK_M, BLOCK_N)
 
+        p = tl.where(blk_mask, p, 0.0)
         if not DIVISIBLE_M:
             p = tl.where(valid_mask, p, 0.0)
         if CAUSAL:
             p = tl.where(causal_mask, p, 0.0)
-        else:
-            p = tl.where(blk_mask, p, 0.0)
+        
 
         # compute dv = dot(p, do)
         if DIVISIBLE_M:
@@ -774,12 +879,11 @@ def _bwd_kv_kernel(
         # compute ds = p * (dp - delta[:, None])
         ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
 
+        ds = tl.where(blk_mask, ds, 0.0)
         if not DIVISIBLE_M:
             ds = tl.where(valid_mask, ds, 0.0)
         if CAUSAL:
             ds = tl.where(causal_mask, ds, 0.0)
-        else:
-            ds = tl.where(blk_mask, ds, 0.0)
         ds = ds.to(input_dtype)
 
         # compute dk = dot(ds.T, q) masking
@@ -976,3 +1080,66 @@ def _bwd_q_kernel(
         tl.store(dq_ptrs, dq.to(input_dtype))
     else:
         tl.store(dq_ptrs, dq.to(input_dtype), mask=mask_m[:, None])
+        
+        
+# benchmark
+import torch
+from einops import rearrange
+DEVICE = torch.device("cuda")
+
+BATCH, N_HEADS, N_KV_HEADS, HEAD_DIM = 1, 28, 4, 128
+# vary seq length for fixed head and batch=4
+configs = []
+for mode in ["bwd"]:
+    for causal in [True]:
+        if mode == "bwd" and not causal:
+            continue
+        configs.append(
+            triton.testing.Benchmark(
+                x_names=["N_CTX"],
+                x_vals=[2**i for i in range(12, 16)],
+                line_arg="provider",
+                line_vals=["triton-fp16"],
+                line_names=["Triton [FP16]"],
+                styles=[("red", "-")],
+                ylabel="TFLOPS",
+                plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}",
+                args={
+                    "H": N_HEADS,
+                    "H_kv": N_KV_HEADS,
+                    "BATCH": BATCH,
+                    "HEAD_DIM": HEAD_DIM,
+                    "mode": mode,
+                    "causal": causal,
+                },
+            ))
+
+@triton.testing.perf_report(configs)
+def bench_flash_attention(BATCH, H, H_kv, N_CTX, HEAD_DIM, causal, mode, provider, device=DEVICE):
+    assert mode in ["fwd", "bwd"]
+    dtype = torch.float16
+    q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, H_kv, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, H_kv, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    block_mask = torch.randint(0, 2, (BATCH, H_kv, N_CTX, N_CTX)).gt(0).to(device)
+    block_mask = rearrange(block_mask, 'b h m (n r) -> b h m n r', r=16)[..., 0]
+    block_mask.diagonal(dim1=-2, dim2=-1).fill_(1)
+    block_mask[..., 0] = 1
+    sm_scale = 1.3
+    fn = lambda: masked_attention(q, k, v, block_mask, causal, sm_scale)
+    if mode == "bwd":
+        o = fn()
+        do = torch.randn_like(o)
+        fn = lambda: o.backward(do, retain_graph=True)
+    ms = triton.testing.do_bench(fn)
+   
+    flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
+    total_flops = 2 * flops_per_matmul
+    if causal:
+        total_flops *= 0.5
+    if mode == "bwd":
+        total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
+    return total_flops * 1e-12 / (ms * 1e-3)
+
+if __name__ == "__main__":
+    bench_flash_attention.run(save_path=".", print_data=True)

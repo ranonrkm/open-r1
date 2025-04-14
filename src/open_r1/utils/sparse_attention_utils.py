@@ -8,7 +8,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import logging
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Attention, Qwen2Model, Qwen2DecoderLayer, Qwen2MLP, Qwen2RMSNorm, Qwen2RotaryEmbedding
 from transformers.modeling_outputs import BaseModelOutputWithPast
-
+from tqdm import tqdm
 try:
     from .flag_attn import flash_attn_triton_interface
     from .flag_attn import cplsh_attn_triton_interface, masked_attn_triton_interface
@@ -246,6 +246,93 @@ def nsa_attn_forward(
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights  
 
+def headwise_nsa_attn_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_value = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    seq_len = hidden_states.size(1)
+    local = self.local
+    topk = max(1, self.topk // BLOCK_SIZE)
+    n_full_attn = max(MIN_FULL_ATTN_SIZE, local)
+    attn_mask = None
+
+    assert self.layer_idx > 0, "layer_idx should be greater than 0"
+    if seq_len > n_full_attn:
+        query_0, query_1 = torch.tensor_split(query_states, [self.num_key_value_groups], dim=1)
+        key_0, key_1 = torch.tensor_split(key_states, [1], dim=1)
+        value_0, value_1 = torch.tensor_split(value_states, [1], dim=1)
+        
+        # dense attention
+        dense_attn_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+        attn_output_0, attn_weights = dense_attn_interface(
+            self,
+            query_0,
+            key_0,
+            value_0,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,  # main diff with Llama
+            **kwargs,
+        )
+        
+        # sparse attention
+        with torch.no_grad():
+            group_mean_query = rearrange(
+                query_1, 
+                "b (h r) m d -> b h r m d", 
+                r=self.num_key_value_groups
+            ).mean(dim=2)   # B H M D
+            
+            attn_mask = create_block_mask(group_mean_query, key_1, local, n_full_attn, topk)
+          
+        attn_output_1, attn_weights = masked_attn_triton_interface(
+            self,
+            query_1,
+            key_1,
+            value_1,
+            attn_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,  # main diff with Llama
+            **kwargs,
+        )
+        
+        attn_output = torch.cat([attn_output_0, attn_output_1], dim=2)
+        
+    else:
+        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,  # main diff with Llama
+            **kwargs,
+        )
+    
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights  
 
 class CPLSHAttention(Qwen2Attention):
     def __init__(self, config, layer_idx):
@@ -570,9 +657,231 @@ class CPLSHDecoderLayer(Qwen2DecoderLayer):
 
         return outputs
     
+def profile_attn_forward(method: str):
+    # write a profiling script for nsa_attn_forward
+    
+    B, H, H_kv, M, D = 1, 28, 4, 32768, 128
+    block_size = 16
+    q = torch.randn(B, H, M, D, requires_grad=True, device="cuda:0", dtype=torch.float16)
+    k = torch.randn(B, H_kv, M, D, requires_grad=True, device="cuda:0", dtype=torch.float16)
+    v = torch.randn(B, H_kv, M, D, requires_grad=True, device="cuda:0", dtype=torch.float16)
+    block_mask = torch.randint(0, 2, (B, H_kv, M, M)).gt(0).cuda()
+    block_mask.diagonal(dim1=-2, dim2=-1).fill_(1)
+    block_mask = rearrange(block_mask, 'b h m (n r) -> b h m n r', r=block_size)[..., 0]
+    block_mask[..., 0] = 1
+    sm_scale = D**-0.5
+    
+    
+    # warmup
+    print("Warming up...")
+    for _ in tqdm(range(10)):
+        if method == "nsa":
+            out = masked_attn_triton_interface(
+                None,
+                q,
+                k,
+                v,
+                block_mask,
+                dropout=0.0,
+                scaling=sm_scale,
+            )[0]   
+        elif method == "flag":
+            out = flash_attn_triton_interface(
+                None,
+                q,
+                k,
+                v,
+                attention_mask=None, 
+                dropout=0.0,
+                scaling=sm_scale,
+            )[0]   
+        else:
+            attn_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+            out = attn_interface(
+                None,
+                q,
+                k,
+                v,
+                attention_mask=None, 
+                dropout=0.0,
+                scaling=sm_scale,
+                sliding_window=None,
+            )[0]
+        
+        out.sum().backward()
+        q.grad = None
+        k.grad = None
+        v.grad = None
+    
+    # Force CUDA synchronization before profiling
+    torch.cuda.synchronize()
+    
+    # Use a simpler profiling approach focused on getting a Chrome trace
+    print("Starting profiling...")
+    
+    # Create a custom context manager to handle profiler cleanup
+    class ProfilerContext:
+        def __init__(self):
+            self.prof = None
+            
+        def __enter__(self):
+            self.prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA
+                ],
+                record_shapes=True
+            )
+            self.prof.__enter__()
+            return self.prof
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self.prof is not None:
+                self.prof.__exit__(exc_type, exc_val, exc_tb)
+                
+                # Safely export chrome trace
+                try:
+                    print("Exporting Chrome trace...")
+                    self.prof.export_chrome_trace(f"logs/{method}_attn_forward.json")
+                    print(f"Chrome trace exported successfully to logs/{method}_attn_forward.json")
+                except Exception as e:
+                    print(f"Chrome trace export error: {e}")
+    
+    # Use our custom context manager
+    with ProfilerContext() as prof:
+        for _ in tqdm(range(10)):
+            if method == "nsa":
+                out = masked_attn_triton_interface(
+                    None,
+                    q,
+                    k,
+                    v,
+                    block_mask,
+                    dropout=0.0,
+                    scaling=sm_scale,
+                )[0]  
+            elif method == "flag":
+                out = flash_attn_triton_interface(
+                    None,
+                    q,
+                    k,
+                    v,
+                    attention_mask=None, 
+                    dropout=0.0,
+                    scaling=sm_scale,
+                )[0]   
+            else:
+                attn_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+                out = attn_interface(
+                    None,
+                    q,
+                    k,
+                    v,
+                    attention_mask=None, 
+                    dropout=0.0,
+                    scaling=sm_scale,
+                    sliding_window=None,
+                )[0]
+            out.sum().backward()
+            torch.cuda.synchronize()
+            q.grad = None
+            k.grad = None
+            v.grad = None
+        
+        # Make sure CUDA is synchronized before exiting the profiler context
+        torch.cuda.synchronize()
+    
+    # Print a message about viewing the trace
+    print("\nTo view the Chrome trace:")
+    print("1. Open Chrome/Chromium browser")
+    print("2. Navigate to chrome://tracing")
+    print(f"3. Click 'Load' and select logs/{method}_attn_forward.json")
+    
+def profile_attn_module(method: str):
+    # profile nsa_attn_forward
+    from transformers import AutoConfig
+    from types import MethodType
+    from tqdm import tqdm
+    
+    # method = "nsa"
+    method = "flash"
+    
+    config = AutoConfig.from_pretrained("Qwen/Qwen2.5-7B-Instruct", torch_dtype=torch.float16, attn_implementation="flash_attention_2")
+    attn_module = Qwen2Attention(config=config, layer_idx=1)
+    attn_module.eval()
+    attn_module = attn_module.to("cuda:0", dtype=torch.float16)
+    if method == "nsa":
+        attn_module.local = 1024
+        attn_module.topk = 1024
+        attn_module.forward = MethodType(nsa_attn_forward, attn_module)
+    
+    hidden_states = torch.randn(1, 32768, 3584, requires_grad=True, device="cuda:0", dtype=torch.float16)
+    position_embeddings = (torch.randn(1, 32768, 128, device="cuda:0", dtype=torch.float16),
+                           torch.randn(1, 32768, 128, device="cuda:0", dtype=torch.float16))
+    
+    # profile
+    print("warming up...")
+    for _ in tqdm(range(10)):
+        out = attn_module(
+            hidden_states,
+            position_embeddings,
+            attention_mask=None,
+        )[0]
+        out.sum().backward()
+        hidden_states.grad = None
+            
+    torch.cuda.synchronize()
+        
+    print("profiling...")
+    # Use a simpler profiling approach focused on getting a Chrome trace
+    print("Starting profiling...")
+    
+    # Create a custom context manager to handle profiler cleanup
+    class ProfilerContext:
+        def __init__(self):
+            self.prof = None
+            
+        def __enter__(self):
+            self.prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA
+                ],
+                record_shapes=True
+            )
+            self.prof.__enter__()
+            return self.prof
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self.prof is not None:
+                self.prof.__exit__(exc_type, exc_val, exc_tb)
+                
+                # Safely export chrome trace
+                try:
+                    print("Exporting Chrome trace...")
+                    self.prof.export_chrome_trace(f"logs/{method}_attn_module.json")
+                    print(f"Chrome trace exported successfully to logs/{method}_attn_module.json")
+                except Exception as e:
+                    print(f"Chrome trace export error: {e}")
+                    
+    with ProfilerContext() as prof:
+        for _ in tqdm(range(10)):
+            out = attn_module(
+                hidden_states,
+                position_embeddings,
+                attention_mask=None,
+            )[0]
+            out.sum().backward()
+            hidden_states.grad = None
+            
+        torch.cuda.synchronize()
+        
+    print("profiling done")
+    
+    prof.export_chrome_trace(f"logs/{method}_attn_module.json")
+    
+
 if __name__ == "__main__":
-    # test create_block_mask
-    query = torch.randn(1, 8, 1024, 128)
-    key = torch.randn(1, 8, 1024, 128)
-    attn_mask = create_block_mask(query, key, 128, 256, 1)
-    print(attn_mask.shape)
+    profile_attn_forward("nsa")
+    # profile_attn_forward("flag")
+    # profile_attn_module("flash")
