@@ -9,11 +9,16 @@ from transformers.utils import logging
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Attention, Qwen2Model, Qwen2DecoderLayer, Qwen2MLP, Qwen2RMSNorm, Qwen2RotaryEmbedding
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from .flag_attn import flash_attn_triton_interface
-from .flag_attn import cplsh_attn_triton_interface
-
+try:
+    from .flag_attn import flash_attn_triton_interface
+    from .flag_attn import cplsh_attn_triton_interface, masked_attn_triton_interface
+except ImportError:
+    from flag_attn import flash_attn_triton_interface, cplsh_attn_triton_interface, masked_attn_triton_interface
 
 logger = logging.get_logger(__name__)
+
+BLOCK_SIZE = 16
+MIN_FULL_ATTN_SIZE = 2048
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -153,6 +158,95 @@ def local_attn_forward(
 
 # divide query_states, key_states, value_states into two parts - first head (or head group) for dense attention or rest for sparse attention
 
+@torch.no_grad()
+def create_block_mask(query, key, local, offset, topk):
+    # create key blocks from key given block_size
+    B, H, N, D = key.shape
+    blocked_len = (N // BLOCK_SIZE) * BLOCK_SIZE
+    key_blocks = rearrange(key[..., :blocked_len, :], 
+                           "b h (n r) d -> b h n r d", 
+                           r=BLOCK_SIZE).mean(dim=-2)  # B H N_blk D
+    
+    local_mask = torch.ones(N, N, device=key.device, dtype=torch.bool).tril_(0)
+    assert offset >= local, "offset should be greater than or equal to local"
+    dynamic_mask = torch.ones(N - offset, N, device=key.device, dtype=torch.bool).tril_(offset - local)
+    local_mask[offset:, :].logical_xor_(dynamic_mask)
+    
+    # block level masks
+    local_mask = rearrange(local_mask, "m (n r) -> m n r", r=BLOCK_SIZE).any(dim=-1)
+    dynamic_mask = rearrange(dynamic_mask, "m (n r) -> m n r", r=BLOCK_SIZE).all(dim=-1)
+    
+    w = torch.einsum("bhmd,bhnd->bhmn", query.narrow(2, offset, N - offset), key_blocks)
+    w.masked_fill_(dynamic_mask.logical_not(), -float("inf"))
+    topk_blocks = w.topk(topk, dim=-1).indices
+    topk_mask = torch.zeros_like(w, dtype=torch.bool)
+    topk_mask.scatter_(-1, topk_blocks, 1)
+    topk_mask.logical_and_(dynamic_mask)
+    
+    local_mask = local_mask[None, None, ...].expand(B, H, -1, -1)
+    attn_mask = torch.cat(
+        [local_mask[..., :offset, :], topk_mask | local_mask[..., offset:, :]],
+        dim=-2
+    )
+    return attn_mask
+
+def nsa_attn_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_value = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    seq_len = hidden_states.size(1)
+    local = self.local
+    topk = max(1, self.topk // BLOCK_SIZE)
+    n_full_attn = max(MIN_FULL_ATTN_SIZE, local)
+    attn_mask = None
+
+    assert self.layer_idx > 0, "layer_idx should be greater than 0"
+    if seq_len > n_full_attn:
+        with torch.no_grad():
+            group_mean_query = rearrange(
+                query_states, 
+                "b (h r) m d -> b h r m d", 
+                r=self.num_key_value_groups
+            ).mean(dim=2)   # B H M D
+            
+            attn_mask = create_block_mask(group_mean_query, key_states, local, n_full_attn, topk)
+        
+        attention_interface = masked_attn_triton_interface  
+    else:
+        attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attn_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=None,  # main diff with Llama
+        **kwargs,
+    )
+    
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights  
+
+
 class CPLSHAttention(Qwen2Attention):
     def __init__(self, config, layer_idx):
         super().__init__(config, layer_idx)
@@ -253,7 +347,7 @@ class CPLSHAttention(Qwen2Attention):
 class CPLSHForCausalLM(Qwen2ForCausalLM):
     def __init__(self, config):
         super().__init__(config)
-        config.L = 64
+        config.L = 48
         config.K = 256
         self.model = CPLSHModel(config)
         self.vocab_size = config.vocab_size
@@ -318,7 +412,7 @@ class CPLSHModel(Qwen2Model):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        assert past_key_values is None
+        # assert past_key_values is None
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -475,3 +569,10 @@ class CPLSHDecoderLayer(Qwen2DecoderLayer):
             outputs += (self_attn_weights,)
 
         return outputs
+    
+if __name__ == "__main__":
+    # test create_block_mask
+    query = torch.randn(1, 8, 1024, 128)
+    key = torch.randn(1, 8, 1024, 128)
+    attn_mask = create_block_mask(query, key, 128, 256, 1)
+    print(attn_mask.shape)

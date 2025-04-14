@@ -4,21 +4,24 @@ import torch
 import torch.nn.functional as F
 from trl import SFTTrainer
 from ..configs import SFTConfig
-from .sparse_attention_utils import local_attn_forward, CPLSHForCausalLM
+from .sparse_attention_utils import local_attn_forward, CPLSHForCausalLM, nsa_attn_forward
 from .repeat_attention import RepeatedForCausalLM
 
 class SparseSFTTrainer(SFTTrainer):
-    '''
     def _create_model_from_path(self, model_path: str, args: SFTConfig):
         model = super()._create_model_from_path(model_path, args)
 
         def patch_forward(module: torch.nn.Module) -> None:
             for name, child in module.named_children():
-                if "self_attn" in name:
+                if "self_attn" in name and child.layer_idx > 0:
                     if args.sparse_attn == "local":
                         child.forward = MethodType(local_attn_forward, child)
                         if child.layer_idx not in args.full_attn_layers:
                             child.local = args.local
+                    elif args.sparse_attn == "nsa":
+                        child.forward = MethodType(nsa_attn_forward, child)
+                        child.local = args.local
+                        child.topk = args.sparse_attn_topk
                     else:
                         raise NotImplementedError(f"Sparse attention type {args.sparse_attn} not implemented")
                         # child.sink = args.sink
@@ -29,8 +32,9 @@ class SparseSFTTrainer(SFTTrainer):
 
         patch_forward(model)
         return model
-        '''
     
+    
+    '''
     def _create_model_from_path(self, model_path: str, args: SFTConfig):
         """Creates a model from a path or model identifier."""
         model_init_kwargs = args.model_init_kwargs or {}
@@ -59,6 +63,7 @@ class SparseSFTTrainer(SFTTrainer):
         model = RepeatedForCausalLM.from_pretrained(model_path, **model_init_kwargs)
         
         return model
+    '''
     
     @staticmethod
     def align_inputs(inputs):
@@ -83,7 +88,7 @@ class SparseSFTTrainer(SFTTrainer):
         Compute training loss and additionally compute token accuracies
         """
         mode = "eval" if self.control.should_evaluate else "train"
-        # inputs = self.align_inputs(inputs)
+        inputs = self.align_inputs(inputs)
         (loss, outputs) = super().compute_loss(
             model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch
         )
@@ -133,8 +138,9 @@ class SparseSFTTrainer(SFTTrainer):
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
         
         # model.model.layers[i].self_attn.gamma to be logged as gamma_i
-        for i in range(1, len(self.model.model.layers)):
-            logs[f"gamma_{i}"] = self.model.model.layers[i].self_attn.gamma.abs().max().item()
+        if hasattr(self.model.model.layers[1].self_attn, "gamma"):
+            for i in range(1, len(self.model.model.layers)):
+                logs[f"gamma_{i}"] = self.model.model.layers[i].self_attn.gamma.abs().max().item()
         
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
