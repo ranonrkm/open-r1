@@ -1,7 +1,7 @@
 from typing import Optional, Union, Tuple, Callable
 import torch
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention, BlockMask
 import torch._dynamo as dynamo
 from einops import rearrange
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -188,6 +188,8 @@ def create_block_sparse_mask(query, key, local, offset, topk):
         dim=-2
     )
     return attn_mask
+    # num_blocks = torch.full(topk_blocks.shape[:-1], device=key.device, dtype=torch.int32, fill_value=topk)
+    # return num_blocks, topk_blocks
 
 def repeat_kv_mask(block_mask, nrep):
     B, H, M, n_kv_blocks = block_mask.shape
@@ -235,30 +237,21 @@ def nsa_attn_forward(
         query_states_splits = torch.tensor_split(query_states, num_splits, dim=1)
         key_states_splits = torch.tensor_split(key_states, num_splits, dim=1)
         value_states_splits = torch.tensor_split(value_states, num_splits, dim=1)
-        
-        # Compile the flex_attention function for memory efficiency
-        compiled_flex_attention = torch.compile(
-            flex_attention,
-            mode="default",
-            fullgraph=False,
-            dynamic=True
-        )
+        causal_mask = torch.ones(seq_len, seq_len, device=key_states.device, dtype=torch.bool).tril_(0)
         
         for q_split, k_split, v_split in zip(query_states_splits, key_states_splits, value_states_splits):
             with torch.no_grad():
                 group_mean_query = q_split.mean(dim=1, keepdim=True)    # B r M D
             
-                block_sparse_mask = create_block_sparse_mask(group_mean_query, k_split, local, n_full_attn, topk)[0][0]
-                B, H, N_CTX, _ = q_split.shape
-                def flexify_block_mask(b, h, q_idx, k_idx):
-                    return block_sparse_mask[q_idx, k_idx // BLOCK_SIZE] #& (q_idx >= k_idx)
-                attn_mask = create_block_mask(flexify_block_mask, None, None, N_CTX, N_CTX, BLOCK_SIZE=[BLOCK_SIZE, 1])
+                block_mask = create_block_sparse_mask(group_mean_query, k_split, local, n_full_attn, topk)
+                block_mask = block_mask.unsqueeze(-1).expand(-1, -1, -1, -1, BLOCK_SIZE)
+                block_mask = rearrange(block_mask, "b h m n r -> b h m (n r)")
+                block_mask = block_mask & causal_mask[None, None, :, :]
             
-            k_split, v_split = repeat_kv(k_split, v_split, self.num_key_value_groups)
-            out_split, *_ = compiled_flex_attention(q_split, k_split, v_split, block_mask=attn_mask, scale=self.scaling)
-            out_split = out_split.reshape(B, H, N_CTX, -1)
+            out_split, *_ = ALL_ATTENTION_FUNCTIONS["sdpa"](self, q_split, k_split, v_split, attn_mask, scaling=self.scaling, dropout_p=0.0 if not self.training else self.attention_dropout)
             attn_output.append(out_split)
-        attn_output = torch.cat(attn_output, dim=1)
+        attn_output = torch.cat(attn_output, dim=2)
+        attn_weights = None
     else:
         attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
 
@@ -306,6 +299,7 @@ def headwise_nsa_attn_forward(
     assert self.layer_idx > 0, "layer_idx should be greater than 0"
     if seq_len > n_full_attn:
         query_0, query_1 = torch.tensor_split(query_states, [self.num_key_value_groups], dim=1)
+        import pdb; pdb.set_trace()
         key_0, key_1 = torch.tensor_split(key_states, [1], dim=1)
         value_0, value_1 = torch.tensor_split(value_states, [1], dim=1)
         
@@ -372,6 +366,29 @@ class CPLSHAttention(Qwen2Attention):
         self.sink = 0
         self.local = 2048
 
+    @staticmethod
+    def hash_codes(q, k, rotation):
+        chunk_size = 1024
+        num_chunks = N // chunk_size        
+        query_codes = []
+        key_codes = []
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = seq_len if i == num_chunks - 1 else (i + 1) * chunk_size
+            _q_norma_chunk = _q_norma[..., start:end, :]  # B H r M D
+            _key_norma_chunk = _key_norma[..., start:end, :]  # B H_kv N D
+            _query_codes = torch.einsum("bhnd,hlkd->bhnlk", 
+                                        _q_norma_chunk, 
+                                        rotation).argmax(dim=-1)  # B H M L
+            _key_codes = torch.einsum("bhnd,hlkd->bhnlk",
+                                       _key_norma_chunk,
+                                       rotation).argmax(dim=-1)
+            query_codes.append(_query_codes)
+            key_codes.append(_key_codes)
+        query_codes = torch.cat(query_codes, dim=-2)    # B H r M L
+        key_codes = torch.cat(key_codes, dim=-2)        # B H_kv N L
+        return query_codes, key_codes
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -401,34 +418,12 @@ class CPLSHAttention(Qwen2Attention):
         assert self.layer_idx > 0, "layer_idx should be greater than 0"
         if seq_len > n_full_attn:
             with torch.no_grad():
-                #_q_norma = query_states.narrow(2, n_full_attn, seq_len - n_full_attn) 
-                #_q_norma = _q_norma / _q_norma.norm(dim=-1, keepdim=True)  
-                _q_norma = query_states / query_states.norm(dim=-1, keepdim=True)  # B H N D
                 _q_norma = rearrange(_q_norma, "b (h r) m d -> b h r m d", r=self.num_key_value_groups)
-                _key_norma = key_states / key_states.norm(dim=-1, keepdim=True)  # B H_kv N D
+                _key_norma = key_states - key_states.mean(dim=2, keepdim=True)
 
-                query_codes = []
-                key_codes = []
-                chunk_size = 1024
-                num_chunks = seq_len // chunk_size
-                for i in range(num_chunks):
-                    start = i * chunk_size
-                    end = seq_len if i == num_chunks - 1 else (i + 1) * chunk_size
-                    _q_norma_chunk = _q_norma[..., start:end, :]  # B H r M D
-                    _key_norma_chunk = _key_norma[..., start:end, :]  # B H_kv N D
-                    _query_codes = torch.einsum("bhrnd,hlkd->bhrnlk", 
-                                                _q_norma_chunk, 
-                                                rotation).argmax(dim=-1)  # B H r M L
-                    _key_codes = torch.einsum("bhnd,hlkd->bhnlk",
-                                               _key_norma_chunk,
-                                               rotation).argmax(dim=-1)
-                    query_codes.append(_query_codes)
-                    key_codes.append(_key_codes)
-
-                query_codes = torch.cat(query_codes, dim=-2)    # B H r M L
-                key_codes = torch.cat(key_codes, dim=-2)        # B H_kv N L
-                query_codes = rearrange(query_codes, "b h r m l -> b (h r) m l")  # B H M L
-                
+                query_codes, key_codes = self.hash_codes(query_states, key_states, rotation)
+              
+            '''  
             # query key hash matches moved to kernel, otherwise OOM
             attn_output, attn_weights = cplsh_attn_triton_interface(
                 self,
@@ -443,7 +438,22 @@ class CPLSHAttention(Qwen2Attention):
                 sliding_window=self.local,  # main diff with Llama
                 **kwargs,
             )
-                
+            '''
+            def get_flex_mask(b, h, q_idx, k_idx):
+                return (query_codes[..., q_idx, :] == key_codes[..., k_idx, :]).sum(dim=-1).gt(1) & (q_idx >= k_idx)
+            
+            
+            attention_interface = ALL_ATTENTION_FUNCTIONS["flex_attention"]
+            attn_output, attn_weights = attention_interface(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.local,  # main diff with Llama
+                **kwargs,
+            )
         else:
             attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
 
