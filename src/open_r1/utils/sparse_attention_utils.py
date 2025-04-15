@@ -1,6 +1,8 @@
 from typing import Optional, Union, Tuple, Callable
 import torch
 from torch import nn
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+import torch._dynamo as dynamo
 from einops import rearrange
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -9,11 +11,8 @@ from transformers.utils import logging
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Attention, Qwen2Model, Qwen2DecoderLayer, Qwen2MLP, Qwen2RMSNorm, Qwen2RotaryEmbedding
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from tqdm import tqdm
-try:
-    from .flag_attn import flash_attn_triton_interface
-    from .flag_attn import cplsh_attn_triton_interface, masked_attn_triton_interface
-except ImportError:
-    from flag_attn import flash_attn_triton_interface, cplsh_attn_triton_interface, masked_attn_triton_interface
+from .flag_attn import flash_attn_triton_interface
+from .flag_attn import cplsh_attn_triton_interface, masked_attn_triton_interface
 
 logger = logging.get_logger(__name__)
 
@@ -159,7 +158,7 @@ def local_attn_forward(
 # divide query_states, key_states, value_states into two parts - first head (or head group) for dense attention or rest for sparse attention
 
 @torch.no_grad()
-def create_block_mask(query, key, local, offset, topk):
+def create_block_sparse_mask(query, key, local, offset, topk):
     # create key blocks from key given block_size
     B, H, N, D = key.shape
     blocked_len = (N // BLOCK_SIZE) * BLOCK_SIZE
@@ -190,6 +189,18 @@ def create_block_mask(query, key, local, offset, topk):
     )
     return attn_mask
 
+def repeat_kv_mask(block_mask, nrep):
+    B, H, M, n_kv_blocks = block_mask.shape
+    block_mask_rep = block_mask.unsqueeze(2).expand(B, H, nrep, M, n_kv_blocks).reshape(B, H * nrep, M, n_kv_blocks)
+    return block_mask_rep
+
+def repeat_kv(k, v, nrep):
+    B, H, M, D = k.shape
+    k_rep = k.unsqueeze(2).expand(B, H, nrep, M, D).reshape(B, H * nrep, M, D)
+    v_rep = v.unsqueeze(2).expand(B, H, nrep, M, D).reshape(B, H * nrep, M, D)
+    return k_rep, v_rep
+
+
 def nsa_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -217,30 +228,51 @@ def nsa_attn_forward(
 
     assert self.layer_idx > 0, "layer_idx should be greater than 0"
     if seq_len > n_full_attn:
-        with torch.no_grad():
-            group_mean_query = rearrange(
-                query_states, 
-                "b (h r) m d -> b h r m d", 
-                r=self.num_key_value_groups
-            ).mean(dim=2)   # B H M D
-            
-            attn_mask = create_block_mask(group_mean_query, key_states, local, n_full_attn, topk)
+        attn_output = []
         
-        attention_interface = masked_attn_triton_interface  
+        # split attention computation into 4 parts
+        num_splits = self.config.num_key_value_heads
+        query_states_splits = torch.tensor_split(query_states, num_splits, dim=1)
+        key_states_splits = torch.tensor_split(key_states, num_splits, dim=1)
+        value_states_splits = torch.tensor_split(value_states, num_splits, dim=1)
+        
+        # Compile the flex_attention function for memory efficiency
+        compiled_flex_attention = torch.compile(
+            flex_attention,
+            mode="default",
+            fullgraph=False,
+            dynamic=True
+        )
+        
+        for q_split, k_split, v_split in zip(query_states_splits, key_states_splits, value_states_splits):
+            with torch.no_grad():
+                group_mean_query = q_split.mean(dim=1, keepdim=True)    # B r M D
+            
+                block_sparse_mask = create_block_sparse_mask(group_mean_query, k_split, local, n_full_attn, topk)[0][0]
+                B, H, N_CTX, _ = q_split.shape
+                def flexify_block_mask(b, h, q_idx, k_idx):
+                    return block_sparse_mask[q_idx, k_idx // BLOCK_SIZE] #& (q_idx >= k_idx)
+                attn_mask = create_block_mask(flexify_block_mask, None, None, N_CTX, N_CTX, BLOCK_SIZE=[BLOCK_SIZE, 1])
+            
+            k_split, v_split = repeat_kv(k_split, v_split, self.num_key_value_groups)
+            out_split, *_ = compiled_flex_attention(q_split, k_split, v_split, block_mask=attn_mask, scale=self.scaling)
+            out_split = out_split.reshape(B, H, N_CTX, -1)
+            attn_output.append(out_split)
+        attn_output = torch.cat(attn_output, dim=1)
     else:
         attention_interface = ALL_ATTENTION_FUNCTIONS["flash_attention_2"]
 
-    attn_output, attn_weights = attention_interface(
-        self,
-        query_states,
-        key_states,
-        value_states,
-        attn_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        sliding_window=None,  # main diff with Llama
-        **kwargs,
-    )
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attn_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,  # main diff with Llama
+            **kwargs,
+        )
     
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
