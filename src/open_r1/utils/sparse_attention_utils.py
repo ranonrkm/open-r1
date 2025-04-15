@@ -883,5 +883,5 @@ def profile_attn_module(method: str):
 
 if __name__ == "__main__":
     profile_attn_forward("nsa")
-    # profile_attn_forward("flag")
-    # profile_attn_module("flash")
+    profile_attn_forward("flag")
+    profile_attn_module("flash")

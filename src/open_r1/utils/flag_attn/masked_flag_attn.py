@@ -770,7 +770,7 @@ def _bwd_kv_kernel(
     q_ptrs = Q + (offs_m_init[:, None] * stride_qm + offs_k[None, :] * stride_qk) # (BLOCK_M, BLOCK_DMODEL)
     k_ptrs = K + (offs_n[:, None] * stride_kn + offs_k[None, :] * stride_kk) # (BLOCK_N, BLOCK_DMODEL)
     v_ptrs = V + (offs_n[:, None] * stride_vn + offs_k[None, :] * stride_vk) # (BLOCK_N, BLOCK_DMODEL)
-    blk_mask_ptrs = BLK_MASK + (offs_m_init[:, None] * stride_bm + offs_blk_n[None, :] * stride_bn) # (BLOCK_M, BLOCK_N)
+    blk_mask_ptrs = BLK_MASK + (offs_m_init[None, :] * stride_bm + offs_blk_n[:, None] * stride_bn) # (BLOCK_M, BLOCK_N)
     do_ptrs = DO + (offs_m_init[:, None] * stride_dom + offs_k[None, :] * stride_dok) # (BLOCK_M, BLOCK_DMODEL)
 
     dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_k[None, :] * stride_dvk) # (BLOCK_N, BLOCK_DMODEL)
@@ -809,17 +809,16 @@ def _bwd_kv_kernel(
             if DIVISIBLE_N:
                 blk_mask = tl.load(blk_mask_ptrs)
             else:
-                blk_mask = tl.load(blk_mask_ptrs, mask=mask_n[None, :])
+                blk_mask = tl.load(blk_mask_ptrs, mask=mask_n[:, None])
         else:
             mask_m = offs_m < M
             valid_mask = mask_m[:, None] # & mask_n
             q = tl.load(q_ptrs, mask=mask_m[:, None])
             if DIVISIBLE_N:
-                blk_mask = tl.load(blk_mask_ptrs, mask=mask_m[:, None])
+                blk_mask = tl.load(blk_mask_ptrs, mask=mask_m[None, :])
             else:
-                blk_mask = tl.load(blk_mask_ptrs, mask=mask_m[:, None] & mask_n[None, :])
+                blk_mask = tl.load(blk_mask_ptrs, mask=mask_m[None, :] & mask_n[:, None])
                 
-            
         # recompute p = softmax(qk * sm_scale, dim=-1)
         s = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         s += tl.dot(q, tl.trans(k))
@@ -837,7 +836,7 @@ def _bwd_kv_kernel(
             l = tl.load(L + offs_m, mask=mask_m)
         p = tl.math.exp2(s * qk_scale - l[:, None] * log2e) # (BLOCK_M, BLOCK_N)
 
-        p = tl.where(blk_mask, p, 0.0)
+        p = tl.where(tl.trans(blk_mask), p, 0.0)
         if not DIVISIBLE_M:
             p = tl.where(valid_mask, p, 0.0)
         if CAUSAL:
@@ -879,7 +878,7 @@ def _bwd_kv_kernel(
         # compute ds = p * (dp - delta[:, None])
         ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
 
-        ds = tl.where(blk_mask, ds, 0.0)
+        # ds = tl.where(blk_mask, ds, 0.0)
         if not DIVISIBLE_M:
             ds = tl.where(valid_mask, ds, 0.0)
         if CAUSAL:
@@ -1059,13 +1058,11 @@ def _bwd_q_kernel(
         ds = p * (dp - delta[:, None]) # (BLOCK_M, BLOCK_N)
 
         # mask ds to ensure no small values
+        ds = tl.where(blk_mask, ds, 0.0)
         if not DIVISIBLE_N:
             ds = tl.where(valid_mask, ds, 0.0)
         if CAUSAL:
-            causal_mask = causal_mask & blk_mask
             ds = tl.where(causal_mask, ds, 0.0)
-        else:
-            ds = tl.where(blk_mask, ds, 0.0)
 
         dq += tl.dot(ds.to(input_dtype), k)
 
