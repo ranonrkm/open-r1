@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 import torch
 from .flag_attn import attention
 from .cplsh_flag_attn import cplsh_attention
-
+from .masked_flag_attn import masked_attention
 def flash_attn_triton_interface(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -58,4 +58,27 @@ def cplsh_attn_triton_interface(
     )
     attn_output = attn_output.transpose(1, 2)
 
+    return attn_output, None
+
+def masked_attn_triton_interface(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, None]:
+    kwargs.pop("is_causal", None)
+    attn_output = masked_attention(
+        query,
+        key,
+        value,
+        attention_mask,
+        causal=True,
+        sm_scale=scaling,
+        dropout_p=dropout,
+    )
+    attn_output = attn_output.transpose(1, 2)
     return attn_output, None

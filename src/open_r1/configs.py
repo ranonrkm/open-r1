@@ -71,6 +71,9 @@ class SFTConfig(trl.SFTConfig):
     )
     local: int = field(
         default=1024, metadata={"help": "The local to use for sparse attention."}
+    )    
+    headwise: bool = field(
+        default=False, metadata={"help": "Whether to use headwise attention."}
     )
     sparse_attn_topk: int = field(
         default=256, metadata={"help": "The topk to use for sparse attention."}
