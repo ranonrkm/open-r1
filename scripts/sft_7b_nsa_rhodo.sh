@@ -7,7 +7,7 @@ model_path=$2
 export WANDB_PROJECT=sparsity
 export WANDB_API_KEY=43249e11b6dc61a3e85f8385185eecc99d122c3d
 accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r1/sft.py \
-    --model_name_or_path ${model_path}  \
+    --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
     --model_revision main \
     --torch_dtype bfloat16 \
     --attn_implementation flash_attention_2 \
@@ -35,7 +35,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --logging_steps 5 \
     --logging_strategy steps \
     --packing true \
-    --output_dir data/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise}-resume \
+    --output_dir data/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise} \
     --overwrite_output_dir \
     --push_to_hub true \
     --report_to wandb \
@@ -47,5 +47,6 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --sparse_attn nsa \
     --sparse_attn_topk ${budget} \
     --local 1024 \
-    --headwise ${headwise} \
-    --resume_from_checkpoint ${model_path}
+    --headwise ${headwise} 
+
+mv data/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise} /sensei-fs/users/xuhuang/rsadhukh/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise}-resume
