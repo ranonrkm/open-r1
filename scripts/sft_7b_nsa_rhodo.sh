@@ -47,4 +47,5 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --sparse_attn nsa \
     --sparse_attn_topk ${budget} \
     --local 1024 \
-    --headwise ${headwise}
+    --headwise ${headwise} \
+    --resume_from_checkpoint ${model_path}
