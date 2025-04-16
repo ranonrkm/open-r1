@@ -24,12 +24,12 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --per_device_train_batch_size 1 \
     --max_steps -1 \
     --num_train_epochs 3 \
-    --bf16 \
+    --bf16 true \
     --do_eval false \
-    --use_liger_kernel True \
-    --use_liger True \
+    --use_liger_kernel true \
+    --use_liger true \
     --eval_strategy no \
-    --gradient_checkpointing \
+    --gradient_checkpointing true \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --log_level info \
     --logging_steps 5 \
@@ -37,7 +37,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --packing true \
     --output_dir data/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise}-resume \
     --overwrite_output_dir \
-    --push_to_hub \
+    --push_to_hub true \
     --report_to wandb \
     --save_strategy steps \
     --save_steps 1000 \
