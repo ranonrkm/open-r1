@@ -47,6 +47,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --sparse_attn nsa \
     --sparse_attn_topk ${budget} \
     --local 1024 \
-    --headwise ${headwise} 
+    --headwise ${headwise} \
+    --resume_from_checkpoint ${model_path}
 
 mv data/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise} /sensei-fs/users/xuhuang/rsadhukh/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise}-resume
