@@ -29,7 +29,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python eval_math.py \
         --batch_size 8 \
         --max_len 32768 \
         --gen_len 30768 
-fi
 
 mkdir -p /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL}/dense_eval
 cp ${MODEL}/*.jsonl /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL}/dense_eval/
