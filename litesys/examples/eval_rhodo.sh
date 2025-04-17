@@ -2,6 +2,12 @@
 
 MODEL=$1
 echo "MODEL: ${MODEL}"
+# get the base name of the model
+MODEL_BASE_NAME=$(basename ${MODEL})
+
+
+
+mkdir -p /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL_BASE_NAME}
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python eval_math.py \
         --model ${MODEL} \
@@ -12,6 +18,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python eval_math.py \
         --max_len 32768 \
         --gen_len 30768 
 
+for file in ${MODEL_BASE_NAME}/*.jsonl; do
+    head -n 1 $file
+    cp $file /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL_BASE_NAME}/
+done
+
+
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python eval_math.py \
         --model ${MODEL} \
         --task amc23 \
@@ -20,6 +32,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python eval_math.py \
         --batch_size 10 \
         --max_len 32768 \
         --gen_len 30768 
+
+for file in ${MODEL_BASE_NAME}/*.jsonl; do
+    head -n 1 $file
+    cp $file /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL_BASE_NAME}/
+done
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python eval_math.py \
         --model ${MODEL} \
@@ -30,5 +47,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python eval_math.py \
         --max_len 32768 \
         --gen_len 30768 
 
-mkdir -p /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL}/dense_eval
-cp ${MODEL}/*.jsonl /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL}/dense_eval/
+for file in ${MODEL_BASE_NAME}/*.jsonl; do
+    head -n 1 $file
+    cp $file /sensei-fs/users/xuhuang/rsadhukh/litesys/eval/${MODEL_BASE_NAME}/
+done
