@@ -7,7 +7,7 @@ nepochs=1
 export WANDB_PROJECT=sparsity
 export WANDB_API_KEY=43249e11b6dc61a3e85f8385185eecc99d122c3d
 accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r1/sft.py \
-    --model_name_or_path Qwen/Qwen2.5-7B-Instruct \
+    --model_name_or_path ${model_path} \
     --model_revision main \
     --torch_dtype bfloat16 \
     --attn_implementation flash_attention_2 \
