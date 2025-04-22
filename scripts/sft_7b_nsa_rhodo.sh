@@ -1,8 +1,9 @@
 #!/bin/bash
 
 budget=1024
-headwise=$1
-model_path=$2
+# headwise=$1
+model_path=$1
+nepochs=$2
 
 export WANDB_PROJECT=sparsity
 export WANDB_API_KEY=43249e11b6dc61a3e85f8385185eecc99d122c3d
@@ -23,7 +24,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --per_device_eval_batch_size 1 \
     --per_device_train_batch_size 1 \
     --max_steps -1 \
-    --num_train_epochs 3 \
+    --num_train_epochs ${nepochs} \
     --bf16 true \
     --do_eval false \
     --use_liger_kernel true \
@@ -35,7 +36,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --logging_steps 5 \
     --logging_strategy steps \
     --packing true \
-    --output_dir data/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise} \
+    --output_dir data/OpenR1-Qwen-7B-Math-Instruct-budget${budget}-epoch${nepochs} \
     --overwrite_output_dir \
     --push_to_hub true \
     --report_to wandb \
@@ -47,7 +48,6 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --sparse_attn nsa \
     --sparse_attn_topk ${budget} \
     --local 1024 \
-    --headwise ${headwise} \
-    --resume_from_checkpoint ${model_path}
+    --headwise false 
 
-mv data/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise} /sensei-fs/users/xuhuang/rsadhukh/OpenR1-Qwen-7B-nsa-B${budget}-hw${headwise}-resume
+mv data/OpenR1-Qwen-7B-Math-Instruct-budget${budget}-epoch${nepochs} /sensei-fs/users/xuhuang/rsadhukh/
