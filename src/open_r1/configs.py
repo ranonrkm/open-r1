@@ -78,6 +78,9 @@ class SFTConfig(trl.SFTConfig):
     sparse_attn_topk: int = field(
         default=256, metadata={"help": "The topk to use for sparse attention."}
     )
+    block_size: int = field(
+        default=16, metadata={"help": "The block size to use for sparse attention."}
+    )
     gated_attention: bool = field(
         default=False, metadata={"help": "Whether to use gated attention."}
     )

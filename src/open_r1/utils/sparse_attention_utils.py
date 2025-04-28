@@ -159,13 +159,13 @@ def local_attn_forward(
 # divide query_states, key_states, value_states into two parts - first head (or head group) for dense attention or rest for sparse attention
 
 @torch.no_grad()
-def create_block_mask(query, key, local, offset, topk):
+def create_block_mask(query, key, local, offset, topk, block_size=16):
     # create key blocks from key given block_size
     B, H, N, D = key.shape
-    blocked_len = (N // BLOCK_SIZE) * BLOCK_SIZE
+    blocked_len = (N // block_size) * block_size
     key_blocks = rearrange(key[..., :blocked_len, :], 
                            "b h (n r) d -> b h n r d", 
-                           r=BLOCK_SIZE).mean(dim=-2)  # B H N_blk D
+                           r=block_size).mean(dim=-2)  # B H N_blk D
     
     local_mask = torch.ones(N, N, device=key.device, dtype=torch.bool).tril_(0)
     assert offset >= local, "offset should be greater than or equal to local"
@@ -173,8 +173,8 @@ def create_block_mask(query, key, local, offset, topk):
     local_mask[offset:, :].logical_xor_(dynamic_mask)
     
     # block level masks
-    local_mask = rearrange(local_mask, "m (n r) -> m n r", r=BLOCK_SIZE).any(dim=-1)
-    dynamic_mask = rearrange(dynamic_mask, "m (n r) -> m n r", r=BLOCK_SIZE).all(dim=-1)
+    local_mask = rearrange(local_mask, "m (n r) -> m n r", r=block_size).any(dim=-1)
+    dynamic_mask = rearrange(dynamic_mask, "m (n r) -> m n r", r=block_size).all(dim=-1)
     
     w = torch.einsum("bhmd,bhnd->bhmn", query.narrow(2, offset, N - offset), key_blocks)
     w.masked_fill_(dynamic_mask.logical_not(), -float("inf"))
@@ -211,7 +211,8 @@ def nsa_attn_forward(
 
     seq_len = hidden_states.size(1)
     local = self.local
-    topk = max(1, self.topk // BLOCK_SIZE)
+    block_size = self.block_size
+    topk = max(1, self.topk // block_size)
     n_full_attn = max(MIN_FULL_ATTN_SIZE, local)
     attn_mask = None
 
@@ -267,7 +268,8 @@ def headwise_nsa_attn_forward(
 
     seq_len = hidden_states.size(1)
     local = self.local
-    topk = max(1, self.topk // BLOCK_SIZE)
+    block_size = self.block_size
+    topk = max(1, self.topk // block_size)
     n_full_attn = max(MIN_FULL_ATTN_SIZE, local)
     attn_mask = None
 

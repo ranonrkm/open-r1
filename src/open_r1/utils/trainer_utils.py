@@ -25,6 +25,7 @@ class SparseSFTTrainer(SFTTrainer):
                             child.forward = MethodType(nsa_attn_forward, child)
                         child.local = args.local
                         child.topk = args.sparse_attn_topk
+                        child.block_size = args.block_size
                     else:
                         raise NotImplementedError(f"Sparse attention type {args.sparse_attn} not implemented")
                         # child.sink = args.sink

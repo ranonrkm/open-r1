@@ -48,6 +48,7 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --sparse_attn nsa \
     --sparse_attn_topk ${budget} \
     --local 1024 \
-    --headwise false 
+    --headwise false \
+    --block_size 32
 
 mv data/OpenR1-Qwen-7B-Math-Instruct-budget${budget}-epoch${nepochs} /sensei-fs/users/xuhuang/rsadhukh/
